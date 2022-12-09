@@ -1,0 +1,62 @@
+#include <iostream>
+#include <opencv2/opencv.hpp>
+#include <torch/torch.h>
+#include <torch/script.h>
+#include "utils.h"
+
+using namespace std;
+
+
+const float CONF_THRESH = 0.1;
+const float IOU_THRESH = 0.45;
+
+
+// void check_model_device(torch::jit::script::Module& model) {
+    // 
+
+at::Tensor predict(cv::Mat cv_img, torch::jit::script::Module& model) {
+    at::Tensor img = preprocess_image(cv_img);
+
+    at::Tensor output = model.forward({img}).toTuple()->elements()[0].toTensor();
+
+    // we have batch size of 1, so we can remove the first dimension
+    output = output.squeeze(0);
+    auto detections = process_detections(output, CONF_THRESH);
+
+
+    std::vector<int> keep = non_max_suppression(detections, CONF_THRESH, IOU_THRESH);
+
+    detections = detections.index_select(0, torch::tensor(keep).to(torch::kCUDA));
+
+    scale_boxes(detections, img.sizes()[3], img.sizes()[2], cv_img.cols, cv_img.rows);
+    return detections;
+}
+
+
+
+int main() {
+
+    // Load the YOLOv5 network from a PyTorch checkpoint file
+    auto model = load_model("yolov5s.torchscript");
+
+    // Load the input image "zidane.jpg"
+    cv::Mat cv_img = cv::imread("zidane.jpg");
+    // convert BGR format to RGB
+    cv::cvtColor(cv_img, cv_img, cv::COLOR_BGR2RGB);
+
+    at::Tensor detections = predict(cv_img, model);
+        // get the number of boxes
+    cout << "detections: " << detections << endl;
+
+    draw_bounding_boxes(detections, cv_img);
+
+    // save the image
+    cv::cvtColor(cv_img, cv_img, cv::COLOR_RGB2BGR);
+    cv::imwrite("output.jpg", cv_img);
+
+    // cv::imshow("image", cv_img);
+    // cv::waitKey(0);
+
+
+    return 0;
+}
