@@ -1,7 +1,10 @@
+#pragma once
 #include <opencv2/opencv.hpp>
 #include <torch/torch.h>
 #include <torch/script.h>
 #include <algorithm>
+
+
 
 using namespace std;
 
@@ -164,6 +167,20 @@ at::Tensor scale_masks(at::Tensor& masks, int im1_w, int im1_h, int im0_w, int i
 
 }
 
+void scale_segments(vector<vector<cv::Point>>& segments, double im1_w, double im1_h, double im0_w, double im0_h) {
+    double upscale = std::max(im0_w / im1_w, im0_h / im1_h);
+
+    double pad_w = (im1_w - im0_w / upscale) / 2;
+    double pad_h = (im1_h - im0_h / upscale) / 2;
+
+    for (int i = 0; i < segments.size(); i++) {
+        for (int j = 0; j < segments[i].size(); j++) {
+            segments[i][j].x = (segments[i][j].x - pad_w) * upscale;
+            segments[i][j].y = (segments[i][j].y - pad_h) * upscale;
+        }
+    }
+}
+
 
 at::Tensor crop_masks(at::Tensor masks, at::Tensor detections) {
     at::Tensor cropped_masks = torch::zeros({masks.size(0), masks.size(1), masks.size(2)});
@@ -200,17 +217,45 @@ at::Tensor process_masks(at::Tensor protos, at::Tensor detections, int im1_w, in
 }
 
 
+vector<vector<cv::Point>> masks_to_segments(at::Tensor masks) {
+     vector<vector<cv::Point>> mask_segments = vector<vector<cv::Point>>();
+
+     masks = (masks > 0.5) * 255;
+
+    for (int i = 0; i < masks.size(0); i++) {
+        at::Tensor mask = masks[i].to(torch::kU8).to(torch::kCPU);
+        cv::Mat cv_mask = cv::Mat(mask.size(0), mask.size(1), CV_8UC1);
+        // Copy data from tensor to cv::Mat
+        memcpy(cv_mask.data, mask.data_ptr(), sizeof(torch::kU8) * mask.numel());
+        vector<vector<cv::Point>> contours = vector<vector<cv::Point>>();
+        cv::findContours(cv_mask, contours, cv::RETR_EXTERNAL, cv::CHAIN_APPROX_SIMPLE);
+
+        // Select the largest contour
+        int max_contour_index = 0;
+        for (int j = 0; j < contours.size(); j++) {
+            if (contours[j].size() > contours[max_contour_index].size()) {
+                max_contour_index = j;
+            }
+        }
+
+        if (contours.size() == 0) {
+            mask_segments.push_back(vector<cv::Point>());
+        } else {
+            mask_segments.push_back(contours[max_contour_index]);
+        }
+        // Add the largest contour to the mask segments
+    }
+
+    return mask_segments;
+}
+
+
+
 
 torch::jit::script::Module load_model(const std::string& model_path) {
     torch::jit::script::Module model = torch::jit::load(model_path);
     model.to(at::kCUDA);
     model.eval();
-    
-    // Warmup model
-    for (int i = 0; i < 10; i++) {
-        model.forward({torch::zeros({1, 3, 640, 640}).to(at::kCUDA)});
-    }
-
     return model;
 }
 
@@ -316,4 +361,48 @@ void draw_masks(at::Tensor& detections, at::Tensor& masks, cv::Mat& img, bool so
     memcpy((void *)mask_mat.data, sum_mask.data_ptr(), sizeof(torch::kU8) * sum_mask.numel());
 
     cv::addWeighted(img, 1, mask_mat, 1, 0.0, img);
+}
+
+
+struct cmd_args {
+    string model_path;
+    float conf_thresh;
+    float iou_thresh;
+    int img_size;
+};
+
+void parse_args(int argc, char *argv[], cmd_args &args)
+{
+    // default values
+    args.model_path = "model.pt";
+    args.conf_thresh = 0.5;
+    args.iou_thresh = 0.5;
+    args.img_size = 640;
+
+    for (int i = 1; i < argc; i++)
+    {
+        if (strcmp(argv[i], "--model-path") == 0)
+        {
+            args.model_path = argv[i+1];
+        }
+        else if (strcmp(argv[i], "--conf-thresh") == 0)
+        {
+            args.conf_thresh = atof(argv[i+1]);
+        }
+        else if (strcmp(argv[i], "--iou-thresh") == 0)
+        {
+            args.iou_thresh = atof(argv[i+1]);
+        }
+        else if (strcmp(argv[i], "--imgsz") == 0)
+        {
+            args.img_size = atoi(argv[i+1]);
+
+            // check that the image size is divisible by 32 (stride)
+            if (args.img_size % 32 != 0)
+            {
+                cout << "Image size must be divisible by 32" << endl;
+                exit(1);
+            }
+        }
+    }
 }
